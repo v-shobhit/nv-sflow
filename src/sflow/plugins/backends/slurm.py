@@ -63,7 +63,14 @@ class SlurmBackend(Backend):
         Try to resolve hostnames + IPs using `scontrol getaddrs`.
         Returns None if scontrol getaddrs is not available or fails.
         """
-        parser = ParseLogHandler(patterns=["{hostname}: {ip_address}:{port}"])
+        # `port` must be typed as digits-only (`:d`). Left untyped, the default
+        # non-greedy field matches the *first* colon-delimited segment as
+        # ip_address and dumps the rest into port -- harmless for IPv4
+        # ("10.0.0.1:6818" has one colon) but wrong for IPv6, which is all
+        # colons ("[fc00:1::abcd]:6818" would parse as ip_address="[fc00",
+        # port="1::abcd]:6818"). Anchoring port to `\d+` forces the match to
+        # backtrack to the real, trailing port number.
+        parser = ParseLogHandler(patterns=["{hostname}: {ip_address}:{port:d}"])
         with temporary_handler(_logger, parser):
             exit_code = await self._subprocess_launcher.run_async(
                 ["scontrol", "getaddrs", nodelist], output_logger=_logger
@@ -153,13 +160,20 @@ class SlurmBackend(Backend):
             line = line.strip()
             if not line or ":" not in line:
                 continue
-            # Handle potential srun prefix like "node1: " in output
-            # Format could be "hostname:ip" or "srun: hostname:ip"
-            parts = line.split(":")
-            if len(parts) >= 2:
-                # Take the last two parts as hostname:ip
-                hostname = parts[-2].strip()
-                ip_address = parts[-1].strip()
+            # Handle potential srun prefix like "srun: " in output.
+            # Format could be "hostname:ip" or "srun: hostname:ip".
+            working = line
+            if working.startswith("srun:"):
+                working = working.split(":", 1)[1].strip()
+            # Split hostname:ip on the *first* remaining colon only. The
+            # hostname never contains a colon, but an IPv6 address does
+            # ("compute00:fc00:1::abcd"), so taking the last two ":"-split
+            # parts (as before) truncated IPv6 addresses down to their last
+            # segment. partition() keeps the whole address intact.
+            if ":" in working:
+                hostname, _, ip_address = working.partition(":")
+                hostname = hostname.strip()
+                ip_address = ip_address.strip()
                 # Skip if it looks like a srun message
                 if hostname.startswith("srun") or not ip_address:
                     continue
