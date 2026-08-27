@@ -631,3 +631,156 @@ def test_srun_fallback_extracts_short_hostname_from_fqdn(monkeypatch, slurm_test
         ("node01", "10.0.0.14"),
         ("node02", "10.0.0.15"),
     ]
+
+
+def test_allocate_success_ipv6_nodes(monkeypatch, slurm_test_logger):
+    """scontrol getaddrs output with IPv6 addresses must keep the full address.
+
+    IPv6 addresses contain multiple colons, so a naive "split off the last
+    colon" parse of "hostname: ip:port" truncates the address (regression
+    covered here; see also the vr72 clusters, which are IPv6-only).
+    """
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="test_backend",
+            type="slurm",
+            account="test_account",
+            partition="batch",
+            nodes=2,
+            time="00:10:00",
+            job_name="test_job",
+            gpus_per_node=4,
+        )
+    )
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 4444444",
+                    "salloc: Nodes compute00,compute02 are ready for job",
+                ],
+            ),
+            (
+                0,
+                [
+                    "compute00: fc00:1::3e8b:6eff:fe39:af8e:6818",
+                    "compute02: fc00:1::3e8b:6eff:fe39:b092:6818",
+                ],
+            ),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    allocation = asyncio.run(backend.allocate())
+
+    assert allocation.allocation_id == "4444444"
+    assert [(n.name, n.ip_address, n.index) for n in allocation.nodes] == [
+        ("compute00", "fc00:1::3e8b:6eff:fe39:af8e", 0),
+        ("compute02", "fc00:1::3e8b:6eff:fe39:b092", 1),
+    ]
+
+
+def test_srun_fallback_handles_ipv6_addresses(monkeypatch, slurm_test_logger):
+    """srun fallback output with IPv6 addresses must keep the full address."""
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="test_backend",
+            type="slurm",
+            account="test_account",
+            partition="batch",
+            nodes=2,
+            time="00:10:00",
+            job_name="test_job",
+            gpus_per_node=4,
+        )
+    )
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 5555555",
+                    "salloc: Nodes compute00,compute02 are ready for job",
+                ],
+            ),
+            # scontrol fails
+            (1, []),
+            # srun fallback: "hostname:$(hostname -i)" with an IPv6 address
+            (
+                0,
+                [
+                    "compute00:fc00:1::3e8b:6eff:fe39:af8e",
+                    "compute02:fc00:1::3e8b:6eff:fe39:b092",
+                ],
+            ),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    allocation = asyncio.run(backend.allocate())
+
+    assert [(n.name, n.ip_address) for n in allocation.nodes] == [
+        ("compute00", "fc00:1::3e8b:6eff:fe39:af8e"),
+        ("compute02", "fc00:1::3e8b:6eff:fe39:b092"),
+    ]
+
+
+def test_srun_fallback_strips_srun_message_prefix(monkeypatch, slurm_test_logger):
+    """A "srun: hostname:ip" diagnostic-prefixed line should still parse."""
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_JOBID", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NODELIST", raising=False)
+    monkeypatch.delenv("SLURM_NODELIST", raising=False)
+
+    backend = SlurmBackend(
+        SlurmBackendConfig(
+            name="test_backend",
+            type="slurm",
+            account="test_account",
+            partition="batch",
+            nodes=1,
+            time="00:10:00",
+            job_name="test_job",
+            gpus_per_node=4,
+        )
+    )
+
+    fake_launcher = _FakeSubprocessLauncher(
+        script=[
+            (
+                0,
+                [
+                    "salloc: Granted job allocation 6666666",
+                    "salloc: Nodes node01 are ready for job",
+                ],
+            ),
+            # scontrol fails
+            (1, []),
+            (
+                0,
+                [
+                    "srun: node01:10.0.0.20",
+                ],
+            ),
+        ]
+    )
+    backend._subprocess_launcher = fake_launcher
+
+    allocation = asyncio.run(backend.allocate())
+
+    assert [(n.name, n.ip_address) for n in allocation.nodes] == [
+        ("node01", "10.0.0.20"),
+    ]
